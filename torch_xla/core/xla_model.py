@@ -14,6 +14,7 @@ import torch_xla.core.xla_env_vars as xenv
 import torch_xla.debug.metrics_saver as ms
 import torch_xla.utils.utils as xu
 import torch_xla.utils.keyd_queue as kq
+from torch_xla.utils.closure_handler import ClosureHandler
 
 _DEVICES = xu.LazyProperty(lambda: torch_xla._XLAC._xla_get_devices())
 
@@ -670,7 +671,7 @@ def collective_permute(value, pairs):
   return result[0]
 
 
-def add_step_closure(closure, args=()):
+def add_step_closure(closure, args=(), run_async=False):
   """Adds a closure to the list of the ones to be run at the end of the step.
 
   Many times during model training there is the need to print/report (print to
@@ -691,26 +692,31 @@ def add_step_closure(closure, args=()):
   Args:
     closure (callable): The function to be called.
     args (tuple): The arguments to be passed to the closure.
+    run_async (bool): If True, run the closure asynchronously
   """
   devctx = _get_device_context()
   step_closures = getattr(devctx, 'step_closures', None)
   if step_closures is None:
     step_closures = []
     devctx.step_closures = step_closures
-  step_closures.append(lambda a=args: closure(*a))
+  step_closures.append((lambda a=args: closure(*a), run_async))
 
 
-def _run_step_closures():
+def _run_step_closures(max_queue_size=-1, timeout=2):
   devctx = _get_device_context()
   step_closures = getattr(devctx, 'step_closures', None)
   if step_closures is not None:
+    closure_handler = getattr(devctx, 'closure_handler', None)
+    if closure_handler is None:
+      closure_handler = ClosureHandler(max_queue_size, timeout)
+      devctx.closure_handler = closure_handler
     devctx.step_closures = []
-    for closure in step_closures:
-      closure()
+    for closure, run_async in step_closures:
+      closure_handler.run(closure, run_async)
   return devctx
 
 
-def mark_step():
+def mark_step(max_queue_size=-1, timeout=2):
   if xu.getenv_as('XLA_EMIT_STEPLOG', bool, False):
     print('torch_xla.core.xla_model::mark_step', file=sys.stderr, flush=True)
   torch_xla._XLAC._xla_step_marker(
@@ -720,7 +726,7 @@ def mark_step():
   # same values from different threads.
   if is_master_ordinal():
     ms.save_metrics()
-  devctx = _run_step_closures()
+  devctx = _run_step_closures(max_queue_size, timeout)
   devctx.all_reduce_token = None
 
 
